@@ -1,0 +1,21 @@
+# Backend (FastAPI)
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Machine Learning / Model
+torch
+torchvision
+numpy
+pydicom
+Pillow
+
+# Frontend (Streamlit)
+streamlit
+requests
+
+# Image processing
+opencv-python-headless
+
+# Optional but recommended for deployment stability
+psutil

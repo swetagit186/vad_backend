@@ -24,6 +24,11 @@ app.add_middleware(
 # Load model once at startup
 MODEL = load_model(model_dir="models", filename="resnet18_25d_vad.pth")
 
+@app.get("/healthz")
+def health_check():
+    return {"status": "ok"}
+
+
 
 @app.get("/")
 def root() -> Dict:

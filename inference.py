@@ -2,67 +2,129 @@
 import os
 from typing import Dict, List
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
+from torchvision.models import resnet18
 
-from architectures.resnet25d import ResNet18_25D
 from preprocessing import (
-    load_dicom_slices,
-    create_25d_tensors,
-    get_middle_slice_base64,
+    collect_dicom_paths_and_metadata,
+    load_and_normalize_slice,
+    resize_to_model,
+    middle_slice_base64,
 )
 
-DEVICE = torch.device("cpu")  # for deployment; change to "cuda" if GPU available
+DEVICE = torch.device("cpu")  # keep CPU for simplicity
 
-CLASS_NAMES = ["Normal", "Alzheimer", "Vascular Dementia"]
+# 👉 IMPORTANT: adjust order to match how you encoded labels during training
+# Example assumption:
+# 0 -> VAD, 1 -> Alzheimer, 2 -> Normal   (change if needed)
+CLASS_NAMES = ["VAD", "Alzheimer", "Normal"]
 
 
-def load_model(model_dir: str = "models", filename: str = "resnet18_25d_vad.pth") -> torch.nn.Module:
-    model = ResNet18_25D(in_channels=3, num_classes=len(CLASS_NAMES))
+def build_resnet18(num_classes: int = 3) -> torch.nn.Module:
+    """
+    Build a plain ResNet18 with fc replaced for num_classes.
+    This matches a typical Jupyter training setup:
+        model = resnet18(weights=...)
+        model.fc = nn.Linear(model.fc.in_features, 3)
+    """
+    model = resnet18(weights=None)  # pretrained weights are overwritten by your .pth
+    in_features = model.fc.in_features
+    model.fc = torch.nn.Linear(in_features, num_classes)
+    return model
+
+
+def load_model(
+    model_dir: str = "models",
+    filename: str = "resnet_model.pth"
+) -> torch.nn.Module:
+    """
+    Load your trained ResNet18 from a .pth whose keys look like:
+      'conv1.weight', 'bn1.weight', 'layer1.0.conv1.weight', 'fc.weight', ...
+    """
+    model = build_resnet18(num_classes=len(CLASS_NAMES))
     path = os.path.join(model_dir, filename)
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file not found at: {path}")
+
     state = torch.load(path, map_location=DEVICE)
-    model.load_state_dict(state)
+
+    # If you saved with torch.save(model.state_dict())
+    # then 'state' is already the state_dict
+    if isinstance(state, dict) and all(isinstance(k, str) for k in state.keys()):
+        model.load_state_dict(state, strict=True)
+    elif isinstance(state, dict) and "state_dict" in state:
+        model.load_state_dict(state["state_dict"], strict=True)
+    else:
+        raise RuntimeError("Unexpected checkpoint format. Expected plain state_dict.")
+
     model.to(DEVICE)
     model.eval()
     return model
 
 
 @torch.no_grad()
-def run_model_on_folder(folder_path: str, model: torch.nn.Module) -> Dict:
+def run_patient_inference(
+    root: str,
+    model: torch.nn.Module,
+    max_slices: int = 300,
+) -> Dict:
     """
-    Run ResNet18 2.5D on all slices of a single patient folder.
-    Returns dict with prediction, confidence, metadata and middle slice image.
+    Run slice-level inference on all DICOM slices in 'root'.
+
+    For memory safety on low-RAM servers:
+      - we process ONE slice at a time
+      - optionally downsample number of slices using 'max_slices'
     """
-    slices, metadata = load_dicom_slices(folder_path)
-    stacks_np = create_25d_tensors(slices)
+    dicom_paths, metadata = collect_dicom_paths_and_metadata(root)
 
-    if not stacks_np:
-        raise RuntimeError("Not enough slices to form 2.5D stacks.")
+    # OPTIONAL: downsample slices if too many
+    if len(dicom_paths) > max_slices:
+        # simple uniform sampling
+        indices = np.linspace(0, len(dicom_paths) - 1, max_slices).astype(int)
+        dicom_paths = [dicom_paths[i] for i in indices]
 
-    all_logits: List[torch.Tensor] = []
+    slice_probs: List[np.ndarray] = []
 
-    for stack in stacks_np:
-        # stack: (3, H, W) numpy
-        x = torch.from_numpy(stack).float() / 255.0  # (3,H,W)
-        x = x.unsqueeze(0).to(DEVICE)               # (1,3,H,W)
+    for p in dicom_paths:
+        try:
+            arr = load_and_normalize_slice(p)
+        except Exception:
+            continue
 
-        logits = model(x)                           # (1,C)
-        all_logits.append(logits)
+        arr = resize_to_model(arr)  # (H, W)
 
-    logits_cat = torch.cat(all_logits, dim=0)       # (N_stacks, C)
-    probs = F.softmax(logits_cat, dim=1).mean(dim=0)  # (C,)
+        img_t = torch.from_numpy(arr).float() / 255.0  # (H, W)
+        img_t = img_t.unsqueeze(0)                      # (1, H, W)
+        img_t = img_t.repeat(3, 1, 1)                   # (3, H, W)
+        img_t = img_t.unsqueeze(0).to(DEVICE)           # (1, 3, H, W)
 
-    conf_val, pred_idx = torch.max(probs, dim=0)
-    pred_idx = int(pred_idx.item())
-    confidence = float(conf_val.item())
+        logits = model(img_t)                           # (1, C)
+        probs = F.softmax(logits, dim=1)[0].cpu().numpy()
+        slice_probs.append(probs)
+
+        del img_t, logits, probs
+
+    if not slice_probs:
+        raise RuntimeError("No valid slices could be processed from DICOMs.")
+
+    probs_arr = np.stack(slice_probs, axis=0)    # (N_slices, C)
+    mean_probs = probs_arr.mean(axis=0)          # (C,)
+
+    pred_idx = int(mean_probs.argmax())
     prediction = CLASS_NAMES[pred_idx]
+    confidence = float(mean_probs[pred_idx])
 
-    middle_slice_b64 = get_middle_slice_base64(slices)
+    preview_b64 = middle_slice_base64(dicom_paths)
+    per_class = {CLASS_NAMES[i]: float(mean_probs[i]) for i in range(len(CLASS_NAMES))}
 
     return {
         "prediction": prediction,
         "confidence": confidence,
+        "probabilities": per_class,
+        "num_slices_used": int(probs_arr.shape[0]),
         "patient_metadata": metadata,
-        "middle_slice_base64": middle_slice_b64,
+        "preview_base64": preview_b64,
     }

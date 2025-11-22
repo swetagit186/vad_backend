@@ -2,139 +2,109 @@
 import os
 import io
 import base64
-from typing import List, Tuple, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pydicom
 from PIL import Image
 
+IMG_SIZE = 224  # must match your training
 
-IMG_SIZE = 224
 
-
-def load_dicom_slices(folder: str) -> Tuple[List[np.ndarray], Dict[str, str]]:
+def collect_dicom_paths_and_metadata(root: str) -> Tuple[List[str], Dict[str, str]]:
     """
-    Load valid MRI images from a patient folder.
-
-    Accepts shapes:
-      - (H, W)
-      - (1, H, W) -> squeeze
-      - (N, H, W) -> multi-frame, use each frame
-      - (H, W, 3) -> RGB, convert to grayscale
-
-    Returns:
-      slices: list of 2D float32 arrays
-      metadata: dict of basic patient info
+    Walk 'root' and collect all .dcm files.
+    Sort by InstanceNumber if available.
+    Also extract basic patient metadata from the first readable DICOM.
     """
-    slices: List[np.ndarray] = []
-    ds_list = []
+    dicom_paths: List[str] = []
+    first_ds = None
 
-    for f in os.listdir(folder):
-        if not f.lower().endswith(".dcm"):
-            continue
+    for dirpath, _, filenames in os.walk(root):
+        for fname in filenames:
+            if fname.lower().endswith(".dcm"):
+                full = os.path.join(dirpath, fname)
+                dicom_paths.append(full)
 
-        fpath = os.path.join(folder, f)
+    if not dicom_paths:
+        raise ValueError("No DICOM files found in uploaded folder.")
+
+    # sort by InstanceNumber (read header only)
+    def sort_key(path: str) -> int:
         try:
-            ds = pydicom.dcmread(fpath, force=True)
+            ds = pydicom.dcmread(path, stop_before_pixels=True)
+            return int(getattr(ds, "InstanceNumber", 0))
+        except Exception:
+            return 0
 
-            if "PixelData" not in ds:
-                continue
+    dicom_paths.sort(key=sort_key)
 
-            arr = ds.pixel_array
-
-            # (H, W)
-            if arr.ndim == 2:
-                slices.append(arr.astype(np.float32))
-                ds_list.append(ds)
-
-            # (1, H, W) -> squeeze
-            elif arr.ndim == 3 and arr.shape[0] == 1:
-                slices.append(arr[0].astype(np.float32))
-                ds_list.append(ds)
-
-            # (N, H, W) multi-frame
-            elif arr.ndim == 3 and arr.shape[0] > 1:
-                for i in range(arr.shape[0]):
-                    slices.append(arr[i].astype(np.float32))
-                    ds_list.append(ds)
-
-            # (H, W, 3) RGB -> grayscale
-            elif arr.ndim == 3 and arr.shape[2] == 3:
-                gray = arr.mean(axis=2).astype(np.float32)
-                slices.append(gray)
-                ds_list.append(ds)
-
-            else:
-                continue
-
+    # read first dataset for metadata
+    for p in dicom_paths:
+        try:
+            first_ds = pydicom.dcmread(p, force=True)
+            break
         except Exception:
             continue
 
-    if len(slices) == 0:
-        raise ValueError(f"No valid MRI images found in folder: {folder}")
+    if first_ds is None:
+        raise ValueError("Could not read any DICOM for metadata.")
 
-    first = ds_list[0]
     metadata = {
-        "patient_name": str(getattr(first, "PatientName", "Unknown")),
-        "patient_id": str(getattr(first, "PatientID", "Unknown")),
-        "patient_sex": str(getattr(first, "PatientSex", "Unknown")),
-        "patient_age": str(getattr(first, "PatientAge", "Unknown")),
-        "study_date": str(getattr(first, "StudyDate", "Unknown")),
-        "modality": str(getattr(first, "Modality", "Unknown")),
+        "patient_name": str(getattr(first_ds, "PatientName", "Unknown")),
+        "patient_id": str(getattr(first_ds, "PatientID", "Unknown")),
+        "patient_sex": str(getattr(first_ds, "PatientSex", "Unknown")),
+        "patient_age": str(getattr(first_ds, "PatientAge", "Unknown")),
+        "study_date": str(getattr(first_ds, "StudyDate", "Unknown")),
+        "modality": str(getattr(first_ds, "Modality", "Unknown")),
     }
 
-    return slices, metadata
+    return dicom_paths, metadata
 
 
-def normalize_slice(arr: np.ndarray) -> np.ndarray:
-    """Z-score normalize, then scale to 0–255 uint8."""
-    mean = arr.mean()
-    std = arr.std() or 1e-6
-    norm = (arr - mean) / std
+def load_and_normalize_slice(path: str) -> np.ndarray:
+    """
+    Load a single DICOM slice and return a normalized uint8 image (H, W).
+    Uses percentile-based windowing for robustness.
+    """
+    ds = pydicom.dcmread(path, force=True)
 
-    minv, maxv = norm.min(), norm.max()
-    if maxv - minv < 1e-6:
-        maxv = minv + 1e-6
+    if not hasattr(ds, "PixelData"):
+        raise ValueError(f"No pixel data in DICOM: {path}")
 
-    norm = (norm - minv) / (maxv - minv)
-    norm = (norm * 255.0).clip(0, 255).astype(np.uint8)
-    return norm
+    arr = ds.pixel_array.astype(np.float32)
+
+    # robust windowing
+    p1, p99 = np.percentile(arr, (1, 99))
+    if p99 <= p1:
+        p99 = p1 + 1.0
+
+    arr = np.clip(arr, p1, p99)
+    arr = (arr - p1) / (p99 - p1 + 1e-6)
+    arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
+
+    return arr
 
 
-def resize_slice(np_img: np.ndarray, size: int = IMG_SIZE) -> np.ndarray:
-    img = Image.fromarray(np_img)
+def resize_to_model(img_arr: np.ndarray, size: int = IMG_SIZE) -> np.ndarray:
+    """
+    Resize 2D uint8 slice to (size, size).
+    """
+    img = Image.fromarray(img_arr)
     img = img.resize((size, size))
     return np.array(img, dtype=np.uint8)
 
 
-def create_25d_tensors(slices: List[np.ndarray]) -> List["np.ndarray"]:
+def middle_slice_base64(dicom_paths: List[str]) -> str:
     """
-    Build 2.5D stacks: [i-1, i, i+1] -> (3, H, W), later converted to torch.Tensor.
-    Returns list of np arrays (3, IMG_SIZE, IMG_SIZE).
+    Return base64 PNG of the middle slice, for frontend preview.
     """
-    if len(slices) < 3:
-        return []
+    mid_idx = len(dicom_paths) // 2
+    mid_path = dicom_paths[mid_idx]
+    arr = load_and_normalize_slice(mid_path)
+    arr = resize_to_model(arr)
 
-    stacks: List[np.ndarray] = []
-
-    for i in range(1, len(slices) - 1):
-        s_prev = resize_slice(normalize_slice(slices[i - 1]))
-        s_mid = resize_slice(normalize_slice(slices[i]))
-        s_next = resize_slice(normalize_slice(slices[i + 1]))
-
-        stack = np.stack([s_prev, s_mid, s_next], axis=0)  # (3, H, W)
-        stacks.append(stack)
-
-    return stacks
-
-
-def get_middle_slice_base64(slices: List[np.ndarray]) -> str:
-    """Return base64 PNG of the middle normalized slice."""
-    mid_idx = len(slices) // 2
-    norm = normalize_slice(slices[mid_idx])
-    img = Image.fromarray(norm)
-    img = img.resize((IMG_SIZE, IMG_SIZE))
-
+    img = Image.fromarray(arr)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)

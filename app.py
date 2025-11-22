@@ -8,82 +8,88 @@ from typing import Dict
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from inference import load_model, run_model_on_folder
+from inference import load_model, run_patient_inference
 
-app = FastAPI(title="MRI VAD/Alzheimer/Normal Classifier (ResNet18 2.5D)")
+app = FastAPI(
+    title="MRI VAD / Alzheimer / Normal Classifier (Slice-level ResNet18)"
+)
 
-# CORS (later restrict origins to your frontend domain)
+# Enable CORS (frontend can call this API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # during development
+    allow_origins=["*"],  # during development; tighten later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Load model once at startup
-MODEL = load_model(model_dir="models", filename="resnet18_25d_vad.pth")
+MODEL = load_model()
+
 
 @app.get("/healthz")
-def health_check():
+def health() -> Dict[str, str]:
     return {"status": "ok"}
-
-
-
-@app.get("/")
-def root() -> Dict:
-    return {"message": "MRI Dementia Classifier API is running."}
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)) -> Dict:
     """
-    Accept a ZIP file containing ONE patient's DICOM images.
+    Upload a ZIP containing a single patient's DICOM images.
     Returns:
-      - prediction: Normal / Alzheimer / Vascular Dementia
-      - confidence: probability of predicted class
-      - patient_metadata: basic DICOM fields
-      - middle_slice_base64: PNG base64 of 1 slice for display
+      - prediction (class label)
+      - confidence
+      - per-class probabilities
+      - number of slices used
+      - patient metadata
+      - base64 PNG preview of middle slice
     """
     if not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Please upload a .zip file.")
 
     tmp_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(tmp_dir, "upload.zip")
 
     try:
-        # Save uploaded zip
+        # Save uploaded ZIP
+        zip_path = os.path.join(tmp_dir, "upload.zip")
         with open(zip_path, "wb") as f:
             contents = await file.read()
             f.write(contents)
 
-        # Extract zip
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(tmp_dir)
+        # Extract ZIP
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmp_dir)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid ZIP file.")
 
-        # Find first folder that contains DICOM files
-        dicom_folder = None
-        for root, dirs, files in os.walk(tmp_dir):
-            dcm_files = [f for f in files if f.lower().endswith(".dcm")]
-            if dcm_files:
-                dicom_folder = root
+        # Find the first folder containing DICOM files
+        patient_root = None
+        for root, _, files in os.walk(tmp_dir):
+            if any(fname.lower().endswith(".dcm") for fname in files):
+                patient_root = root
                 break
 
-        if dicom_folder is None:
-            raise HTTPException(status_code=400, detail="No DICOM files found in the uploaded ZIP.")
+        if patient_root is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No DICOM files found in uploaded ZIP.",
+            )
 
-        result = run_model_on_folder(dicom_folder, MODEL)
+        result = run_patient_inference(patient_root, MODEL)
 
         return {
             "prediction": result["prediction"],
             "confidence": result["confidence"],
+            "probabilities": result["probabilities"],
+            "num_slices_used": result["num_slices_used"],
             "patient_metadata": result["patient_metadata"],
-            "middle_slice_base64": result["middle_slice_base64"],
+            "preview_base64": result["preview_base64"],
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

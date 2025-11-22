@@ -94,13 +94,27 @@ def run_patient_inference(
         except Exception:
             continue
 
-        arr = resize_to_model(arr)  # (H, W)
 
-        img_t = torch.from_numpy(arr).float() / 255.0  # (H, W)
-        img_t = img_t.unsqueeze(0)                      # (1, H, W)
-        img_t = img_t.repeat(3, 1, 1)                   # (3, H, W)
-        img_t = img_t.unsqueeze(0).to(DEVICE)           # (1, 3, H, W)
+        # Skip non-2D slices
+        if arr.ndim != 2:
+            continue
+        if arr.shape[0] < 10 or arr.shape[1] < 10:
+            continue
 
+        arr = resize_to_model(arr)  # Now guaranteed 2D
+
+        # Convert to tensor
+        img_t = torch.from_numpy(arr).float()
+
+        # Skip if still not 2D
+        if img_t.ndim != 2:
+            continue
+
+        # Normalize + reshape
+        img_t = img_t / 255.0
+        img_t = img_t.unsqueeze(0)          # (1, H, W)
+        img_t = img_t.repeat(3, 1, 1)       # (3, H, W)
+        img_t = img_t.unsqueeze(0).to(DEVICE)  # (1, 3, H, W)
         logits = model(img_t)                           # (1, C)
         probs = F.softmax(logits, dim=1)[0].cpu().numpy()
         slice_probs.append(probs)

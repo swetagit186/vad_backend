@@ -65,10 +65,29 @@ async def predict(file: UploadFile = File(...)) -> Dict:
 
         # Find the first folder containing DICOM files
         patient_root = None
+        # Find real DICOM folder, skip __MACOSX and ._ files
+        patient_root = None
+
         for root, _, files in os.walk(tmp_dir):
-            if any(fname.lower().endswith(".dcm") for fname in files):
+            if "__MACOSX" in root:
+                continue
+
+            # Keep only real DICOMs, ignore macOS resource forks
+            real_dicoms = [
+                f for f in files
+                if f.lower().endswith(".dcm") and not f.startswith("._")
+            ]
+
+            if real_dicoms:
                 patient_root = root
                 break
+
+        if patient_root is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid DICOM files found in uploaded ZIP."
+            )
+
 
         if patient_root is None:
             raise HTTPException(

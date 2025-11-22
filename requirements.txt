@@ -3,7 +3,9 @@ uvicorn[standard]
 python-multipart
 pydicom
 Pillow
-numpy
+
+# Install NUMPY FIRST (critical)
+numpy==1.26.4
 
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.1.0+cpu
